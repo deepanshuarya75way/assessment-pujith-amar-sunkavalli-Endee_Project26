@@ -26,6 +26,8 @@ class LocalVectorStore:
             self.items.append({
                 "id": str(it["id"]),
                 "vector": it["vector"],
+                "sparse_indices": it.get("sparse_indices", []),
+                "sparse_values": it.get("sparse_values", []),
                 "meta": it.get("meta", {}),
                 "filter": it.get("filter", {}),
             })
@@ -36,6 +38,8 @@ class LocalVectorStore:
         vector: List[float],
         top_k: int = 5,
         filter: Optional[List[Dict[str, Any]]] = None,
+        sparse_indices: Optional[List[int]] = None,
+        sparse_values: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
         scored = []
         for it in self.items:
@@ -48,8 +52,25 @@ class LocalVectorStore:
                             break
                 if not match:
                     continue
-            sim = cosine_similarity(vector, it["vector"])
-            scored.append({"id": it["id"], "score": sim, "meta": it["meta"]})
+            dense_score = cosine_similarity(vector, it["vector"])
+            sparse_score = 0.0
+            if sparse_indices and sparse_values:
+                stored_indices = it.get("sparse_indices", [])
+                stored_values = it.get("sparse_values", [])
+
+                stored_sparse = dict(zip(stored_indices, stored_values))
+
+                for idx, value in zip(sparse_indices, sparse_values):
+                    sparse_score += value * stored_sparse.get(idx, 0.0)
+            
+            score = 0.5* dense_score + 0.5*sparse_score
+
+            scored.append({
+                "id": it["id"],
+                "score": score,
+                "similarity": score,
+                "meta": it["meta"]
+                })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
@@ -86,6 +107,7 @@ class EndeeStore:
                 dimension=self.dimension,
                 space_type="cosine",
                 precision=Precision.INT8,
+                sparse_model = "endee_bm25"
             )
 
     def upsert(self, items: List[Dict[str, Any]]):
@@ -97,6 +119,8 @@ class EndeeStore:
                 batch.append({
                     "id": str(it["id"]),
                     "vector": it["vector"],
+                    "sparse_indices": it.get("sparse_indices", []),
+                    "sparse_values": it.get("sparse_values", []),
                     "meta": it.get("meta", {}),
                     "filter": it.get("filter", {}),
                 })
@@ -112,11 +136,20 @@ class EndeeStore:
         vector: List[float],
         top_k: int = 5,
         filter: Optional[List[Dict[str, Any]]] = None,
+        sparse_indices: Optional[List[Dict[str, Any]]]= None,
+        sparse_values: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
         if self.use_local:
-            return self.local_fallback.query(vector, top_k, filter)
+            return self.local_fallback.query(vector, top_k, filter, sparse_indices, sparse_values)
         try:
             kwargs = {"vector": vector, "top_k": top_k, "include_vectors": False}
+
+            if sparse_indices:
+                kwargs["sparse_indices"] = sparse_indices
+
+            if sparse_values:
+                kwargs["sparse_values"] = sparse_values
+                
             if filter:
                 kwargs["filter"] = filter
             results = self.index.query(**kwargs)

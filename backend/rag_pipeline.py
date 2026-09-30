@@ -1,13 +1,28 @@
 """Orchestrates the full RAG pipeline: chunk → embed → store → retrieve → LLM."""
 from __future__ import annotations
-from typing import List, Tuple
+from typing import Any, List, Tuple
 import uuid
 
+from backend import embeddings
 from embeddings import get_embedder
 from vector_store import get_store
 from pdf_parser import chunk_text
 from llm_service import run_analysis, run_chat
+from endee_model import SparseModel 
 
+_sparse_model = SparseModel(model_name = "endee/bm25")
+
+def _sparse_encode(texts: list[str]):
+    embeddings = []
+
+    for embeddings in _sparse_model.embed(texts):
+        obj= embeddings.as_object()
+
+        embeddings.append({
+            "indices": obj["indices"].tolist(),
+            "values": obj["values"].tolist(),
+        })
+    return embeddings
 
 def _ingest(session_id: str, resume_text: str, jd_text: str) -> Tuple[List[str], List[str]]:
     emb = get_embedder()
@@ -21,24 +36,32 @@ def _ingest(session_id: str, resume_text: str, jd_text: str) -> Tuple[List[str],
 
     if resume_chunks:
         vecs = emb.encode(resume_chunks)
+        sparse_vecs = _sparse_encode(resume_chunks)
+
         for i, (c, v) in enumerate(zip(resume_chunks, vecs)):
             cid = f"{session_id}_r_{i}"
             resume_ids.append(cid)
             items.append({
                 "id": cid,
                 "vector": v,
+                "sparse_indices" : sv["indices"],
+                "sparse_values" : sv["values"],
                 "meta": {"session": session_id, "kind": "resume", "idx": i, "text": c[:1500]},
                 "filter": {"session": session_id, "kind": "resume"},
             })
 
     if jd_chunks:
         vecs = emb.encode(jd_chunks)
+        sparse_vecs = _sparse_encode(jd_chunks)
+
         for i, (c, v) in enumerate(zip(jd_chunks, vecs)):
             cid = f"{session_id}_j_{i}"
             jd_ids.append(cid)
             items.append({
                 "id": cid,
                 "vector": v,
+                "sparse_indices" : sv["indices"],
+                "sparse_values" : sv["values"],
                 "meta": {"session": session_id, "kind": "jd", "idx": i, "text": c[:1500]},
                 "filter": {"session": session_id, "kind": "jd"},
             })
@@ -51,10 +74,20 @@ def _retrieve(session_id: str, query_text: str, top_k: int = 6, kind: str | None
     emb = get_embedder()
     store = get_store()
     qv = emb.encode_one(query_text)
+    sparse_query = next(
+        _sparse_model.query_embed(query_text)
+
+    )
+
+    sparse_obj = sparse_query.as_object()
+
+    sparse_indices = sparse_obj["indices"].tolist()
+    sparse_values: Any = sparse_obj["indices"].tolist()
+    
     flt = [{"session": {"$eq": session_id}}]
     if kind:
         flt.append({"kind": {"$eq": kind}})
-    return store.query(qv, top_k=top_k, filter=flt)
+    return store.query(qv, top_k=top_k, filter=flt, sparse_indices=sparse_indices, sparse_values=sparse_values)
 
 
 def _context_from_hits(hits: List[dict]) -> str:
@@ -67,6 +100,7 @@ def _context_from_hits(hits: List[dict]) -> str:
         if txt:
             parts.append(f"[{kind} | sim={score:.2f}]\n{txt}" if score is not None else f"[{kind}]\n{txt}")
     return "\n\n".join(parts)
+
 
 
 async def analyze(resume_text: str, jd_text: str) -> dict:
